@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="IconCam">
+<title>IconCam</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font-family: -apple-system, system-ui, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom); }
+  #stage { position: relative; flex: 1; min-height: 0; background: #111; border-radius: 12px; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #hud { position: absolute; top: 8px; left: 8px; right: 8px; display: flex; justify-content: space-between; pointer-events: none; }
+  .pill { background: rgba(30,30,30,.75); padding: 6px 10px; border-radius: 999px; font-size: 13px; }
+  #rec { display: none; color: #ff453a; font-variant-numeric: tabular-nums; }
+  #controls { padding: 10px 0; display: flex; align-items: center; justify-content: center; gap: 14px; flex-wrap: wrap; }
+  button, select { font: inherit; color: #fff; background: #2c2c2e; border: 0; border-radius: 10px; padding: 10px 14px; }
+  button:disabled { opacity: .4; }
+  #recbtn { width: 76px; height: 76px; border-radius: 50%; background: transparent; border: 4px solid #fff; padding: 0; position: relative; }
+  #recbtn::after { content: ""; position: absolute; inset: 7px; background: #ff3b30; border-radius: 50%; transition: all .15s; }
+  #recbtn.on::after { inset: 20px; border-radius: 6px; }
+  details { margin: 0 0 8px; background: #1c1c1e; border-radius: 10px; padding: 8px 12px; }
+  summary { cursor: pointer; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+  .clip { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid #333; font-size: 14px; }
+  .clip button { padding: 6px 10px; }
+  #msg { font-size: 13px; color: #aaa; text-align: center; padding-bottom: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <video id="v" autoplay playsinline muted></video>
+    <div id="hud">
+      <div class="pill" id="cam">No camera</div>
+      <div class="pill" id="rec">● 00:00:00</div>
+    </div>
+  </div>
+  <div id="msg">Plug in the camera, then tap Start camera.</div>
+  <div id="controls">
+    <button id="startbtn">Start camera</button>
+    <button id="recbtn" disabled aria-label="Record"></button>
+    <button id="settingsbtn" onclick="document.getElementById('panel').open=!document.getElementById('panel').open">Settings / Clips</button>
+  </div>
+  <details id="panel" style="max-height:35vh;overflow:auto">
+    <summary>Settings &amp; saved clips</summary>
+    <div class="row">
+      <label>Camera <select id="camsel"></select></label>
+      <label>Quality <select id="res">
+        <option value="1920x1080">1080p</option>
+        <option value="1280x720">720p</option>
+        <option value="3840x2160">4K (if supported)</option>
+      </select></label>
+    </div>
+    <div class="row">
+      <label>Split clips every <select id="seg">
+        <option value="3">3 min</option>
+        <option value="5" selected>5 min</option>
+        <option value="10">10 min</option>
+      </select></label>
+      <label><input type="checkbox" id="flip"> Flip 180° (recorded video too)</label>
+      <label><input type="checkbox" id="mic" checked> Record sound</label>
+    </div>
+    <div id="clips"></div>
+  </details>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('v');
+let stream = null, outStream = null, recorder = null, recording = false;
+let segTimer = null, tickTimer = null, startTs = 0, wakeLock = null;
+let canvas = null, ctx = null, rafId = 0;
+
+/* ---------- storage (IndexedDB, so long rides don't live in RAM) ---------- */
+let dbp;
+function db() {
+  if (!dbp) dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('iconcam', 1);
+    r.onupgradeneeded = () => {
+      r.result.createObjectStore('clips', { keyPath: 'id' });
+      r.result.createObjectStore('chunks', { keyPath: ['clip', 'seq'] });
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return dbp;
+}
+const req = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+async function put(store, val) { const d = await db(); return req(d.transaction(store, 'readwrite').objectStore(store).put(val)); }
+async function allClips() { const d = await db(); return req(d.transaction('clips').objectStore('clips').getAll()); }
+async function clipChunks(id) {
+  const d = await db();
+  return req(d.transaction('chunks').objectStore('chunks').getAll(IDBKeyRange.bound([id, 0], [id, Infinity])));
+}
+async function deleteClip(id) {
+  const d = await db();
+  const t = d.transaction(['clips', 'chunks'], 'readwrite');
+  t.objectStore('clips').delete(id);
+  t.objectStore('chunks').delete(IDBKeyRange.bound([id, 0], [id, Infinity]));
+  await new Promise(r => t.oncomplete = r);
+  renderClips();
+}
+
+/* ---------- helpers ---------- */
+function say(t) { $('msg').textContent = t; }
+function fmt(s) { s = Math.floor(s); const p = n => String(n).padStart(2, '0'); return `${p(s/3600|0)}:${p(s%3600/60|0)}:${p(s%60)}`; }
+function pickMime() {
+  const c = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'];
+  return c.find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+}
+const mime = pickMime();
+const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+
+/* ---------- camera ---------- */
+async function listCams() {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('camsel'), prev = sel.value;
+  sel.innerHTML = '';
+  devs.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.textContent = d.label || `Camera ${i + 1}`;
+    sel.appendChild(o);
+  });
+  if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  return devs;
+}
+
+async function startCamera() {
+  if (recording) return;
+  try {
+    stopCamera();
+    // First call triggers the permission prompt so device labels become available.
+    let tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: $('mic').checked });
+    tmp.getTracks().forEach(t => t.stop());
+    const devs = await listCams();
+    // Prefer a non-built-in camera (the USB one) if the user hasn't picked yet.
+    const builtIn = /front|back|rear|facetime|built/i;
+    if (!$('camsel').dataset.touched) {
+      const ext = devs.find(d => d.label && !builtIn.test(d.label));
+      if (ext) $('camsel').value = ext.deviceId;
+    }
+    const [w, h] = $('res').value.split('x').map(Number);
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: $('camsel').value }, width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30 } },
+      audio: $('mic').checked ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false
+    });
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    const s = stream.getVideoTracks()[0].getSettings();
+    $('cam').textContent = `${stream.getVideoTracks()[0].label || 'Camera'} · ${s.width}×${s.height}`;
+    $('recbtn').disabled = false;
+    $('startbtn').textContent = 'Restart camera';
+    say('Ready. Tap the red button to record.');
+    applyFlipPreview();
+  } catch (e) {
+    say('Camera error: ' + (e.message || e.name));
+    $('cam').textContent = 'No camera';
+  }
+}
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; $('recbtn').disabled = true;
+}
+function applyFlipPreview() { video.style.transform = $('flip').checked ? 'rotate(180deg)' : ''; }
+
+/* Flip 180° for the recording needs a canvas pipeline. */
+function buildOutputStream() {
+  if (!$('flip').checked) return stream;
+  const vt = stream.getVideoTracks()[0], s = vt.getSettings();
+  canvas = document.createElement('canvas');
+  canvas.width = s.width || 1280; canvas.height = s.height || 720;
+  ctx = canvas.getContext('2d');
+  const draw = () => {
+    ctx.save();
+    ctx.translate(canvas.width, canvas.height); ctx.rotate(Math.PI);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+    rafId = requestAnimationFrame(draw);
+  };
+  video.style.transform = '';          // canvas already flips the data; show raw preview unflipped? keep preview flipped:
+  applyFlipPreview();
+  draw();
+  const cs = canvas.captureStream(30);
+  stream.getAudioTracks().forEach(t => cs.addTrack(t));
+  return cs;
+}
+
+/* ---------- recording (auto-split into segments) ---------- */
+let pending = Promise.resolve();
+function startSegment() {
+  const id = Date.now(); let seq = 0;
+  const opts = mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : {};
+  recorder = new MediaRecorder(outStream, opts);
+  recorder.ondataavailable = e => {
+    if (!e.data || !e.data.size) return;
+    const n = seq++;
+    pending = pending.then(() => put('chunks', { clip: id, seq: n, blob: e.data })).catch(() => say('Storage full!'));
+  };
+  recorder.onstop = async () => {
+    await pending;
+    if (seq > 0) await put('clips', { id, mime: recorder.mimeType || mime, chunks: seq, created: id });
+    renderClips();
+    if (recording) startSegment();
+    else finishRecordingUI();
+  };
+  recorder.start(1000);
+  clearTimeout(segTimer);
+  segTimer = setTimeout(() => { if (recorder.state === 'recording') recorder.stop(); }, Number($('seg').value) * 60000);
+}
+
+async function toggleRecord() {
+  if (!recording) {
+    if (!stream) return;
+    outStream = buildOutputStream();
+    recording = true;
+    startTs = Date.now();
+    $('recbtn').classList.add('on'); $('rec').style.display = 'block';
+    $('startbtn').disabled = true;
+    tickTimer = setInterval(() => $('rec').textContent = '● ' + fmt((Date.now() - startTs) / 1000), 500);
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    startSegment();
+    say('Recording… keep this screen open.');
+  } else {
+    recording = false;
+    clearTimeout(segTimer);
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  }
+}
+function finishRecordingUI() {
+  clearInterval(tickTimer); cancelAnimationFrame(rafId);
+  $('recbtn').classList.remove('on'); $('rec').style.display = 'none';
+  $('startbtn').disabled = false;
+  try { wakeLock?.release(); } catch {}
+  say('Saved inside the app. Open Settings / Clips and tap Save to put clips in Photos.');
+  $('panel').open = true;
+}
+
+/* ---------- saved clips ---------- */
+async function renderClips() {
+  const list = (await allClips()).sort((a, b) => b.id - a.id);
+  const box = $('clips'); box.innerHTML = '';
+  if (!list.length) { box.textContent = 'No clips yet.'; return; }
+  for (const c of list) {
+    const row = document.createElement('div'); row.className = 'clip';
+    const label = document.createElement('span');
+    label.textContent = new Date(c.created).toLocaleString();
+    const btns = document.createElement('span');
+    const save = document.createElement('button'); save.textContent = 'Save';
+    save.onclick = () => saveClip(c);
+    const del = document.createElement('button'); del.textContent = 'Delete';
+    del.onclick = () => confirm('Delete this clip?') && deleteClip(c.id);
+    btns.append(save, ' ', del);
+    row.append(label, btns); box.appendChild(row);
+  }
+}
+async function saveClip(c) {
+  say('Preparing clip…');
+  const parts = (await clipChunks(c.id)).map(x => x.blob);
+  const e = c.mime.includes('mp4') ? 'mp4' : 'webm';
+  const file = new File(parts, `ride-${c.id}.${e}`, { type: c.mime.split(';')[0] });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file] });   // choose "Save Video" to put it in Photos
+      say('Done.');
+      return;
+    }
+  } catch (err) { if (err.name === 'AbortError') { say(''); return; } }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(file); a.download = file.name; a.click();
+  say('Downloaded to the Files app.');
+}
+
+/* ---------- wiring ---------- */
+$('startbtn').onclick = startCamera;
+$('recbtn').onclick = toggleRecord;
+$('camsel').onchange = () => { $('camsel').dataset.touched = 1; startCamera(); };
+$('res').onchange = () => stream && startCamera();
+$('mic').onchange = () => stream && startCamera();
+$('flip').onchange = applyFlipPreview;
+navigator.mediaDevices?.addEventListener('devicechange', () => {
+  if (!recording) { listCams(); say('Camera list changed — tap Start camera.'); }
+});
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && recording) {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  }
+});
+if (!navigator.mediaDevices || !window.MediaRecorder) say('This browser lacks camera recording support. Use Safari on iOS 17 or newer.');
+renderClips();
+</script>
+</body>
+</html>
